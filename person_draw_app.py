@@ -147,6 +147,39 @@ class Database:
         except sqlite3.OperationalError:
             pass
 
+        # 专家二库表
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS people2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                unit TEXT,
+                phone TEXT NOT NULL,
+                blocked INTEGER NOT NULL DEFAULT 0,
+                present_count INTEGER NOT NULL DEFAULT 0
+            )
+        """
+        )
+
+        # 抽签预设表
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS draw_presets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                total INTEGER NOT NULL,
+                count1 INTEGER NOT NULL,
+                count2 INTEGER NOT NULL
+            )
+        """
+        )
+        # 插入默认预设（如果为空）
+        c.execute("SELECT COUNT(*) AS cnt FROM draw_presets")
+        if c.fetchone()["cnt"] == 0:
+            c.execute("INSERT INTO draw_presets (name,total,count1,count2) VALUES ('三人',3,2,1)")
+            c.execute("INSERT INTO draw_presets (name,total,count1,count2) VALUES ('五人',5,3,2)")
+            c.execute("INSERT INTO draw_presets (name,total,count1,count2) VALUES ('七人',7,4,3)")
+
         # 抽签会话索引表（每次完整抽 3 人为一次记录）
         c.execute(
             """
@@ -158,10 +191,16 @@ class Database:
             )
         """
         )
-        
+
         # 为旧数据添加 completed 字段（如果不存在）
         try:
             c.execute("ALTER TABLE sessions ADD COLUMN completed INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+
+        # 为 sessions 添加 draw_preset 字段
+        try:
+            c.execute("ALTER TABLE sessions ADD COLUMN draw_preset TEXT")
         except sqlite3.OperationalError:
             pass
 
@@ -181,6 +220,12 @@ class Database:
             )
         """
         )
+
+        # 为 draw_logs 添加 source_db 字段
+        try:
+            c.execute("ALTER TABLE draw_logs ADD COLUMN source_db INTEGER NOT NULL DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
         
         # 接收邮箱列表表
         c.execute(
@@ -372,6 +417,8 @@ class Database:
         c = self.conn.cursor()
         c.execute("DELETE FROM draw_logs")
         c.execute("DELETE FROM sessions")
+        c.execute("UPDATE people SET present_count=0")
+        c.execute("UPDATE people2 SET present_count=0")
         self.conn.commit()
 
     def reset_database(self):
@@ -381,12 +428,18 @@ class Database:
         c.execute("DELETE FROM draw_logs")
         c.execute("DELETE FROM sessions")
         c.execute("DELETE FROM people")
+        c.execute("DELETE FROM people2")
+        c.execute("DELETE FROM draw_presets")
         c.execute("DELETE FROM users")
         # 重新创建默认管理员账户
         c.execute(
             "INSERT INTO users (username,password_hash,role,email,receive_email) VALUES (?,?,?,?,?)",
             ("admin", hash_password("admin"), "admin", "", 1),
         )
+        # 重新插入默认预设
+        c.execute("INSERT INTO draw_presets (name,total,count1,count2) VALUES ('三人',3,2,1)")
+        c.execute("INSERT INTO draw_presets (name,total,count1,count2) VALUES ('五人',5,3,2)")
+        c.execute("INSERT INTO draw_presets (name,total,count1,count2) VALUES ('七人',7,4,3)")
         self.conn.commit()
 
     def update_person(self, person_id, name, phone, unit=""):
@@ -424,15 +477,158 @@ class Database:
         )
         self.conn.commit()
 
-    # ---------- 抽签 / 日志 ----------
+    # ---------- 专家二库表 ----------
 
-    def create_session(self, title):
+    def get_all_people2(self):
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM people2 ORDER BY id ASC")
+        return c.fetchall()
+
+    def get_available_people2(self):
+        """获取专家二库中未被屏蔽的人员列表"""
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM people2 WHERE blocked=0 ORDER BY id ASC")
+        return c.fetchall()
+
+    def add_person2(self, name, phone, unit=""):
         c = self.conn.cursor()
         c.execute(
-            "INSERT INTO sessions (title,created_at,completed) VALUES (?,?,0)",
+            "INSERT INTO people2 (name,unit,phone,blocked,present_count) VALUES (?,?,?,0,0)",
+            (name, unit, phone),
+        )
+        self.conn.commit()
+
+    def delete_person2(self, person_id):
+        c = self.conn.cursor()
+        c.execute("DELETE FROM people2 WHERE id=?", (person_id,))
+        self.conn.commit()
+
+    def delete_all_people2(self):
+        c = self.conn.cursor()
+        c.execute("DELETE FROM people2")
+        self.conn.commit()
+
+    def update_person2(self, person_id, name, phone, unit=""):
+        c = self.conn.cursor()
+        c.execute(
+            "UPDATE people2 SET name=?, unit=?, phone=? WHERE id=?",
+            (name, unit, phone, person_id),
+        )
+        self.conn.commit()
+
+    def set_person2_blocked(self, person_id, blocked):
+        """设置专家二库人员的屏蔽状态"""
+        c = self.conn.cursor()
+        c.execute(
+            "UPDATE people2 SET blocked=? WHERE id=?",
+            (1 if blocked else 0, person_id),
+        )
+        self.conn.commit()
+
+    def increment_present_count2(self, person_id):
+        """增加专家二库专家到场次数"""
+        c = self.conn.cursor()
+        c.execute(
+            "UPDATE people2 SET present_count = COALESCE(present_count, 0) + 1 WHERE id=?",
+            (person_id,),
+        )
+        self.conn.commit()
+
+    def decrement_present_count2(self, person_id):
+        """减少专家二库专家到场次数"""
+        c = self.conn.cursor()
+        c.execute(
+            "UPDATE people2 SET present_count = MAX(COALESCE(present_count, 0) - 1, 0) WHERE id=?",
+            (person_id,),
+        )
+        self.conn.commit()
+
+    def import_people2_from_excel(self, path):
+        if openpyxl is None:
+            raise RuntimeError("缺少 openpyxl 库，无法导入 Excel")
+        wb = openpyxl.load_workbook(path)
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            for row in ws.iter_rows(values_only=True):
+                values = list(row) if row else []
+                if len(values) < 9:
+                    continue
+                name = values[1]
+                unit = values[7]
+                phone = values[8]
+                if not name or not phone:
+                    continue
+                name = str(name).strip()
+                unit = str(unit).strip() if unit else ""
+                phone = str(phone).strip()
+                if name in ("姓名", "") or phone in ("联系电话", ""):
+                    continue
+                c = self.conn.cursor()
+                c.execute("SELECT id FROM people2 WHERE name=? AND phone=?", (name, phone))
+                exist = c.fetchone()
+                if exist:
+                    c.execute(
+                        "UPDATE people2 SET unit=? WHERE id=?",
+                        (unit, exist["id"]),
+                    )
+                    self.conn.commit()
+                else:
+                    c.execute(
+                        "INSERT INTO people2 (name,unit,phone,blocked,present_count) VALUES (?,?,?,0,0)",
+                        (name, unit, phone),
+                    )
+                    self.conn.commit()
+
+    def export_people2_to_excel(self, path):
+        if openpyxl is None:
+            raise RuntimeError("缺少 openpyxl 库，无法导出 Excel")
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "people2"
+        ws.append(["姓名", "单位", "电话", "是否屏蔽"])
+        for row in self.get_all_people2():
+            ws.append([row["name"], row["unit"] or "", row["phone"], "是" if row["blocked"] else "否"])
+        wb.save(path)
+
+    # ---------- 抽签预设 ----------
+
+    def get_draw_presets(self):
+        """获取所有抽签预设，按总人数排序"""
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM draw_presets ORDER BY total ASC, id ASC")
+        return c.fetchall()
+
+    def add_draw_preset(self, name, total, count1, count2):
+        c = self.conn.cursor()
+        c.execute(
+            "INSERT INTO draw_presets (name,total,count1,count2) VALUES (?,?,?,?)",
+            (name, total, count1, count2),
+        )
+        self.conn.commit()
+
+    def delete_draw_preset(self, preset_id):
+        c = self.conn.cursor()
+        c.execute("DELETE FROM draw_presets WHERE id=?", (preset_id,))
+        self.conn.commit()
+
+    def update_draw_preset(self, preset_id, name, total, count1, count2):
+        c = self.conn.cursor()
+        c.execute(
+            "UPDATE draw_presets SET name=?, total=?, count1=?, count2=? WHERE id=?",
+            (name, total, count1, count2, preset_id),
+        )
+        self.conn.commit()
+
+    # ---------- 抽签 / 日志 ----------
+
+    def create_session(self, title, draw_preset=""):
+        c = self.conn.cursor()
+        c.execute(
+            "INSERT INTO sessions (title,created_at,completed,draw_preset) VALUES (?,?,0,?)",
             (
                 title,
                 datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                draw_preset,
             ),
         )
         self.conn.commit()
@@ -458,13 +654,13 @@ class Database:
         c.execute("DELETE FROM sessions WHERE completed=0")
         self.conn.commit()
 
-    def add_draw_log(self, session_id, person_id, order_no, present, absent_reason):
+    def add_draw_log(self, session_id, person_id, order_no, present, absent_reason, source_db=1):
         c = self.conn.cursor()
         c.execute(
             """
             INSERT INTO draw_logs
-            (session_id,person_id,order_no,present,absent_reason,created_at)
-            VALUES (?,?,?,?,?,?)
+            (session_id,person_id,order_no,present,absent_reason,created_at,source_db)
+            VALUES (?,?,?,?,?,?,?)
         """,
             (
                 session_id,
@@ -473,6 +669,7 @@ class Database:
                 1 if present else 0,
                 absent_reason,
                 datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                source_db,
             ),
         )
         self.conn.commit()
@@ -487,15 +684,26 @@ class Database:
         c = self.conn.cursor()
         c.execute(
             """
-            SELECT dl.*, p.name, p.phone
+            SELECT dl.*, p.name, p.phone,
+                   CASE WHEN dl.source_db = 2 THEN p2.name ELSE p.name END AS display_name,
+                   CASE WHEN dl.source_db = 2 THEN p2.phone ELSE p.phone END AS display_phone
             FROM draw_logs dl
-            JOIN people p ON p.id = dl.person_id
+            LEFT JOIN people p ON p.id = dl.person_id
+            LEFT JOIN people2 p2 ON p2.id = dl.person_id
             WHERE dl.session_id=?
             ORDER BY dl.created_at DESC, dl.id DESC
         """,
             (session_id,),
         )
-        return c.fetchall()
+        # 规范化结果：根据 source_db 选择正确的姓名和电话
+        results = []
+        for row in c.fetchall():
+            row_dict = dict(row)
+            if row_dict.get("source_db", 1) == 2:
+                row_dict["name"] = row_dict.get("display_name") or row_dict.get("name") or ""
+                row_dict["phone"] = row_dict.get("display_phone") or row_dict.get("phone") or ""
+            results.append(row_dict)
+        return results
 
     def get_completed_sessions(self):
         """返回已完成抽签的论证项目"""
@@ -508,17 +716,27 @@ class Database:
         c = self.conn.cursor()
         c.execute(
             """
-            SELECT dl.*, p.name, p.phone
+            SELECT dl.*, p.name, p.phone,
+                   CASE WHEN dl.source_db = 2 THEN p2.name ELSE p.name END AS display_name,
+                   CASE WHEN dl.source_db = 2 THEN p2.phone ELSE p.phone END AS display_phone
             FROM draw_logs dl
-            JOIN people p ON p.id = dl.person_id
+            LEFT JOIN people p ON p.id = dl.person_id
+            LEFT JOIN people2 p2 ON p2.id = dl.person_id
             WHERE dl.session_id=? AND dl.present=1
             ORDER BY dl.order_no ASC, dl.id ASC
         """,
             (session_id,),
         )
-        return c.fetchall()
+        results = []
+        for row in c.fetchall():
+            row_dict = dict(row)
+            if row_dict.get("source_db", 1) == 2:
+                row_dict["name"] = row_dict.get("display_name") or row_dict.get("name") or ""
+                row_dict["phone"] = row_dict.get("display_phone") or row_dict.get("phone") or ""
+            results.append(row_dict)
+        return results
 
-    def add_supplement_absent_log(self, session_id, person_id):
+    def add_supplement_absent_log(self, session_id, person_id, source_db=1):
         """补签时新增一条“后续不到场”记录，不修改原记录"""
         order_no = self.get_max_order_no(session_id) + 1
         self.add_draw_log(
@@ -527,6 +745,7 @@ class Database:
             order_no,
             present=False,
             absent_reason="专家后续不到场，进行再次抽选。",
+            source_db=source_db,
         )
 
     def get_max_order_no(self, session_id):
@@ -696,6 +915,7 @@ class Database:
                 "人员ID",
                 "姓名",
                 "手机号",
+                "来源",
                 "到场情况",
                 "备注",
                 "记录时间",
@@ -704,9 +924,12 @@ class Database:
         c = self.conn.cursor()
         c.execute(
             """
-            SELECT dl.*, p.name, p.phone
+            SELECT dl.*, p.name, p.phone,
+                   CASE WHEN dl.source_db = 2 THEN p2.name ELSE p.name END AS display_name,
+                   CASE WHEN dl.source_db = 2 THEN p2.phone ELSE p.phone END AS display_phone
             FROM draw_logs dl
-            JOIN people p ON p.id = dl.person_id
+            LEFT JOIN people p ON p.id = dl.person_id
+            LEFT JOIN people2 p2 ON p2.id = dl.person_id
             ORDER BY dl.session_id DESC, dl.created_at DESC, dl.id DESC
         """
         )
@@ -719,14 +942,23 @@ class Database:
             return "不到场"
 
         for r in c.fetchall():
+            source_db = r["source_db"] if "source_db" in r.keys() else 1
+            if source_db == 2:
+                name_val = r["display_name"] or r["name"] or ""
+                phone_val = r["display_phone"] or r["phone"] or ""
+            else:
+                name_val = r["name"] or ""
+                phone_val = r["phone"] or ""
+            source_text = "专家二库" if source_db == 2 else "专家一库"
             ws2.append(
                 [
                     r["id"],
                     r["session_id"],
                     r["order_no"],
                     r["person_id"],
-                    r["name"],
-                    r["phone"],
+                    name_val,
+                    phone_val,
+                    source_text,
                     present_display(r),
                     r["absent_reason"] or "",
                     r["created_at"],
@@ -903,10 +1135,13 @@ class RegisterFrame(ttk.Frame):
         self.app.show_login_frame()
 
 
-class PeopleFrame(ttk.Frame):
-    def __init__(self, master, app):
+class SinglePeopleFrame(ttk.Frame):
+    """单个专家库管理界面，db_num=1 为专家一库，db_num=2 为专家二库"""
+
+    def __init__(self, master, app, db_num=1):
         super().__init__(master)
         self.app = app
+        self.db_num = db_num
         self.build_ui()
         self.refresh()
 
@@ -914,10 +1149,11 @@ class PeopleFrame(ttk.Frame):
         outer = ttk.Frame(self, padding=30)
         outer.pack(fill="both", expand=True)
 
+        db_label = "专家一库" if self.db_num == 1 else "专家二库"
         top = ttk.Frame(outer)
         top.pack(fill="x", pady=(0, 15))
 
-        ttk.Label(top, text="专家名库", font=SUBTITLE_FONT).pack(
+        ttk.Label(top, text=db_label, font=SUBTITLE_FONT).pack(
             side="left", padx=8
         )
 
@@ -948,11 +1184,6 @@ class PeopleFrame(ttk.Frame):
         ):
             b.pack(side="left", padx=8)
 
-
-
-
-
-
         table_frame = ttk.Frame(outer)
         table_frame.pack(fill="both", expand=True)
 
@@ -979,18 +1210,22 @@ class PeopleFrame(ttk.Frame):
         self.tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
 
-
-
     def set_admin_mode(self, is_admin):
         state = "normal" if is_admin else "disabled"
         for b in (self.btn_add, self.btn_edit, self.btn_del, self.btn_block, self.btn_unblock, self.btn_import):
             b["state"] = state
         self.btn_export["state"] = "normal"
 
+    def _get_all_people(self):
+        if self.db_num == 1:
+            return self.app.db.get_all_people()
+        else:
+            return self.app.db.get_all_people2()
+
     def refresh(self):
         for i in self.tree.get_children():
             self.tree.delete(i)
-        for row in self.app.db.get_all_people():
+        for row in self._get_all_people():
             blocked_text = "是" if row["blocked"] else "否"
             self.tree.insert(
                 "",
@@ -1013,7 +1248,7 @@ class PeopleFrame(ttk.Frame):
         if not pid:
             messagebox.showwarning("提示", "请先选择一条记录")
             return
-        people = {p["id"]: p for p in self.app.db.get_all_people()}
+        people = {p["id"]: p for p in self._get_all_people()}
         if pid not in people:
             return
         p = people[pid]
@@ -1024,7 +1259,10 @@ class PeopleFrame(ttk.Frame):
         if not pid:
             messagebox.showwarning("提示", "请先选择一条记录")
             return
-        self.app.db.set_person_blocked(pid, True)
+        if self.db_num == 1:
+            self.app.db.set_person_blocked(pid, True)
+        else:
+            self.app.db.set_person2_blocked(pid, True)
         self.refresh()
         messagebox.showinfo("成功", "已屏蔽该人员，将不参与抽签")
 
@@ -1033,7 +1271,10 @@ class PeopleFrame(ttk.Frame):
         if not pid:
             messagebox.showwarning("提示", "请先选择一条记录")
             return
-        self.app.db.set_person_blocked(pid, False)
+        if self.db_num == 1:
+            self.app.db.set_person_blocked(pid, False)
+        else:
+            self.app.db.set_person2_blocked(pid, False)
         self.refresh()
         messagebox.showinfo("成功", "已取消屏蔽该人员")
 
@@ -1080,9 +1321,15 @@ class PeopleFrame(ttk.Frame):
                 messagebox.showwarning("提示", "姓名不能为空")
                 return
             if person_id is None:
-                self.app.db.add_person(n, ph, u)
+                if self.db_num == 1:
+                    self.app.db.add_person(n, ph, u)
+                else:
+                    self.app.db.add_person2(n, ph, u)
             else:
-                self.app.db.update_person(person_id, n, ph, u)
+                if self.db_num == 1:
+                    self.app.db.update_person(person_id, n, ph, u)
+                else:
+                    self.app.db.update_person2(person_id, n, ph, u)
             self.refresh()
             dlg.destroy()
 
@@ -1108,20 +1355,23 @@ class PeopleFrame(ttk.Frame):
             messagebox.showwarning("提示", "请先选择一条记录")
             return
         if messagebox.askyesno("确认", "确定要删除该人员吗？"):
-            self.app.db.delete_person(pid)
+            if self.db_num == 1:
+                self.app.db.delete_person(pid)
+            else:
+                self.app.db.delete_person2(pid)
             self.refresh()
 
     def import_excel(self):
         if openpyxl is None:
             messagebox.showerror("错误", "请先安装 openpyxl 库")
             return
-        
+
         # 创建自定义对话框
         dialog = tk.Toplevel(self)
         dialog.title("导入选项")
         dialog.geometry("380x280")
         dialog.resizable(False, False)
-        
+
         # 居中显示
         dialog.update_idletasks()
         width = dialog.winfo_width()
@@ -1129,73 +1379,73 @@ class PeopleFrame(ttk.Frame):
         x = (dialog.winfo_screenwidth() // 2) - (width // 2)
         y = (dialog.winfo_screenheight() // 2) - (height // 2)
         dialog.geometry(f"{width}x{height}+{x}+{y}")
-        
+
         # 添加标签
         label = ttk.Label(dialog, text="请选择导入方式：", font=("SimHei", 11))
         label.pack(pady=15)
-        
+
         # 存储用户选择
         self.import_option = None
-        
+
         # 处理右上角关闭按钮
         def on_close():
             self.import_option = "cancel"
             dialog.destroy()
-        
+
         dialog.protocol("WM_DELETE_WINDOW", on_close)
-        
+
         # 创建按钮框架
         button_frame = ttk.Frame(dialog)
         button_frame.pack(expand=True, fill="both", padx=30)
-        
+
         # 删除当前名库重新导入按钮
         def delete_and_import():
             self.import_option = "delete"
             dialog.destroy()
-        
+
         btn_delete = ttk.Button(
-            button_frame, 
-            text="删除当前名库重新导入", 
+            button_frame,
+            text="删除当前名库重新导入",
             command=delete_and_import,
             width=22
         )
         btn_delete.pack(pady=10, fill="x")
-        
+
         # 保留当前名库继续导入按钮
         def keep_and_import():
             self.import_option = "keep"
             dialog.destroy()
-        
+
         btn_keep = ttk.Button(
-            button_frame, 
-            text="保留当前名库继续导入", 
+            button_frame,
+            text="保留当前名库继续导入",
             command=keep_and_import,
             width=22
         )
         btn_keep.pack(pady=10, fill="x")
-        
+
         # 取消按钮
         def cancel_import():
             self.import_option = "cancel"
             dialog.destroy()
-        
+
         btn_cancel = ttk.Button(
-            button_frame, 
-            text="取消", 
+            button_frame,
+            text="取消",
             command=cancel_import,
             width=22
         )
         btn_cancel.pack(pady=10, fill="x")
-        
+
         # 等待用户选择
         dialog.transient(self)
         dialog.grab_set()
         self.wait_window(dialog)
-        
+
         # 根据用户选择执行操作
         if self.import_option != "delete" and self.import_option != "keep":
             return
-        
+
         # 选择Excel文件
         path = filedialog.askopenfilename(
             title="选择 Excel 文件",
@@ -1203,13 +1453,18 @@ class PeopleFrame(ttk.Frame):
         )
         if not path:
             return
-        
+
         try:
             if self.import_option == "delete":
-                # 删除当前名库
-                self.app.db.delete_all_people()
-            
-            self.app.db.import_people_from_excel(path)
+                if self.db_num == 1:
+                    self.app.db.delete_all_people()
+                else:
+                    self.app.db.delete_all_people2()
+
+            if self.db_num == 1:
+                self.app.db.import_people_from_excel(path)
+            else:
+                self.app.db.import_people2_from_excel(path)
             self.refresh()
             messagebox.showinfo("成功", "导入完成")
         except Exception as e:
@@ -1219,19 +1474,53 @@ class PeopleFrame(ttk.Frame):
         if openpyxl is None:
             messagebox.showerror("错误", "请先安装 openpyxl 库")
             return
+        default_name = "people.xlsx" if self.db_num == 1 else "people2.xlsx"
         path = filedialog.asksaveasfilename(
             defaultextension=".xlsx",
             filetypes=[("Excel 文件", "*.xlsx")],
             title="导出专家名库",
-            initialfile="people.xlsx",
+            initialfile=default_name,
         )
         if not path:
             return
         try:
-            self.app.db.export_people_to_excel(path)
+            if self.db_num == 1:
+                self.app.db.export_people_to_excel(path)
+            else:
+                self.app.db.export_people2_to_excel(path)
             messagebox.showinfo("成功", "导出完成")
         except Exception as e:
             messagebox.showerror("错误", f"导出失败: {e}")
+
+
+class PeopleFrame(ttk.Frame):
+    """专家名库管理，包含专家一库和专家二库两个子标签页"""
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        self.build_ui()
+
+    def build_ui(self):
+        outer = ttk.Frame(self, padding=10)
+        outer.pack(fill="both", expand=True)
+
+        self.notebook = ttk.Notebook(outer)
+        self.notebook.pack(fill="both", expand=True)
+
+        self.frame1 = SinglePeopleFrame(self.notebook, self.app, db_num=1)
+        self.frame2 = SinglePeopleFrame(self.notebook, self.app, db_num=2)
+
+        self.notebook.add(self.frame1, text="专家一库")
+        self.notebook.add(self.frame2, text="专家二库")
+
+    def set_admin_mode(self, is_admin):
+        self.frame1.set_admin_mode(is_admin)
+        self.frame2.set_admin_mode(is_admin)
+
+    def refresh(self):
+        self.frame1.refresh()
+        self.frame2.refresh()
 
 
 class LogsFrame(ttk.Frame):
@@ -1298,6 +1587,7 @@ class LogsFrame(ttk.Frame):
             "created_at",
             "name",
             "phone",
+            "source",
             "present",
             "reason",
         )
@@ -1307,14 +1597,16 @@ class LogsFrame(ttk.Frame):
         self.logs_tree.heading("created_at", text="记录时间")
         self.logs_tree.heading("name", text="姓名")
         self.logs_tree.heading("phone", text="手机号")
+        self.logs_tree.heading("source", text="来源")
         self.logs_tree.heading("present", text="到场情况")
         self.logs_tree.heading("reason", text="备注")
 
         self.logs_tree.column("created_at", width=180, anchor="center", stretch=False)
         self.logs_tree.column("name", width=120, anchor="center", stretch=False)
-        self.logs_tree.column("phone", width=160, anchor="center", stretch=False)
-        self.logs_tree.column("present", width=100, anchor="center", stretch=False)
-        self.logs_tree.column("reason", width=340, stretch=True)
+        self.logs_tree.column("phone", width=140, anchor="center", stretch=False)
+        self.logs_tree.column("source", width=80, anchor="center", stretch=False)
+        self.logs_tree.column("present", width=80, anchor="center", stretch=False)
+        self.logs_tree.column("reason", width=260, stretch=True)
         self.logs_tree.pack(side="left", fill="both", expand=True)
 
         vsb2 = ttk.Scrollbar(right, orient="vertical", command=self.logs_tree.yview)
@@ -1355,6 +1647,7 @@ class LogsFrame(ttk.Frame):
             self.logs_tree.delete(i)
         for r in logs:
             present_text = self._get_present_display(r)
+            source_text = "专家一库" if r.get("source_db", 1) == 1 else "专家二库"
             self.logs_tree.insert(
                 "",
                 "end",
@@ -1362,6 +1655,7 @@ class LogsFrame(ttk.Frame):
                     r["created_at"],
                     r["name"],
                     r["phone"],
+                    source_text,
                     present_text,
                     r["absent_reason"] or "",
                 ),
@@ -1394,7 +1688,8 @@ class LogsFrame(ttk.Frame):
                         state = "后续不到场"
                     else:
                         state = "不到场"
-                    lines.append(f"[{r['created_at']}] 姓名:{r['name']} 手机:{r['phone']} 到场情况:{state} 备注:{r['absent_reason'] or ''}")
+                    source_text = "专家一库" if r.get("source_db", 1) == 1 else "专家二库"
+                    lines.append(f"[{r['created_at']}] 姓名:{r['name']} 手机:{r['phone']} 来源:{source_text} 到场情况:{state} 备注:{r['absent_reason'] or ''}")
                 lines.append("")
             lines.append("=" * 60)
             
@@ -1443,10 +1738,11 @@ class LogsFrame(ttk.Frame):
                     state = "后续不到场"
                 else:
                     state = "不到场"
-                lines.append(f"[{r['created_at']}] 姓名:{r['name']} 手机:{r['phone']} 到场情况:{state} 备注:{r['absent_reason'] or ''}")
+                source_text = "专家一库" if r.get("source_db", 1) == 1 else "专家二库"
+                lines.append(f"[{r['created_at']}] 姓名:{r['name']} 手机:{r['phone']} 来源:{source_text} 到场情况:{state} 备注:{r['absent_reason'] or ''}")
             lines.append("")
             lines.append("=" * 60)
-            
+
             with open(path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
             messagebox.showinfo("成功", "导出完成")
@@ -1471,8 +1767,19 @@ class DrawFrame(ttk.Frame):
         self.present_count = 0
         self.current_person = None
         self.order_no = 0
-        self.people_cache = []
-        self.drawn_person_ids = set()
+        self.people1_cache = []
+        self.people2_cache = []
+        self.drawn_person_ids1 = set()
+        self.drawn_person_ids2 = set()
+        self.draw_total = 3
+        self.draw_count1 = 2
+        self.draw_count2 = 1
+        self.needed_count1 = 0
+        self.needed_count2 = 0
+        self.present_count1 = 0
+        self.present_count2 = 0
+        self.current_source_db = 1
+        self.draw_preset_name = ""
         self.view_mode = "choice"
         self.supplement_session_id = None
         self.supp_new_session_id = None
@@ -1482,6 +1789,15 @@ class DrawFrame(ttk.Frame):
         self.draw_animation_id = None
         self.supp_is_drawing = False
         self.supp_animation_id = None
+        # 补抽双库相关
+        self.supp_people1_cache = []
+        self.supp_people2_cache = []
+        self.supp_drawn_person_ids1 = set()
+        self.supp_drawn_person_ids2 = set()
+        self.supp_needed_per_db = {1: 0, 2: 0}
+        self.supp_current_source_db = 1
+        self.supp_present_count1 = 0
+        self.supp_present_count2 = 0
         self.build_ui()
 
     def build_ui(self):
@@ -1538,86 +1854,121 @@ class DrawFrame(ttk.Frame):
         self._show_view("choice")
 
     def _show_new_draw(self):
-        # 弹出对话框让用户输入项目名称和申请论证单位
+        # 获取抽签预设
+        presets = self.app.db.get_draw_presets()
+        if not presets:
+            messagebox.showwarning("提示", "请先在设置中配置抽签预设")
+            return
+
+        # 弹出对话框让用户输入项目名称、申请论证单位和选择抽签人数
         dialog = tk.Toplevel(self)
         dialog.title("新建论证项目")
-        dialog.geometry("450x280")
         dialog.resizable(False, False)
-        
+
+        container = ttk.Frame(dialog, padding=25)
+        container.pack(fill="both", expand=True)
+
+        # 论证项目名称
+        ttk.Label(container, text="请输入论证项目名称：", font=("SimHei", 11)).pack(anchor="w", pady=(0, 5))
+        name_var = tk.StringVar()
+        entry_name = ttk.Entry(container, textvariable=name_var, width=40)
+        entry_name.pack(fill="x", pady=(0, 10))
+        entry_name.focus_set()
+
+        # 申请论证单位
+        ttk.Label(container, text="请输入申请论证单位：", font=("SimHei", 11)).pack(anchor="w", pady=(0, 5))
+        unit_var = tk.StringVar()
+        entry_unit = ttk.Entry(container, textvariable=unit_var, width=40)
+        entry_unit.pack(fill="x", pady=(0, 15))
+
+        # 抽签人数选择
+        ttk.Label(container, text="请选择抽签人数：", font=("SimHei", 11)).pack(anchor="w", pady=(0, 5))
+        preset_var = tk.IntVar(value=presets[0]["id"])
+        for p in presets:
+            ttk.Radiobutton(
+                container,
+                text=p["name"],
+                variable=preset_var,
+                value=p["id"],
+            ).pack(anchor="w", padx=20, pady=2)
+
+        # 存储用户输入
+        self.new_project_name = None
+        self.new_project_unit = None
+
+        # 按钮框架
+        btn_frame = ttk.Frame(container)
+        btn_frame.pack(pady=(20, 0))
+
+        def on_confirm():
+            self.new_project_name = name_var.get().strip() or "未命名论证项目"
+            self.new_project_unit = unit_var.get().strip() or "未指定单位"
+            self.new_preset_id = preset_var.get()
+            dialog.destroy()
+
+        def on_cancel():
+            self.new_project_name = None
+            self.new_project_unit = None
+            dialog.destroy()
+
+        def on_close():
+            self.new_project_name = None
+            self.new_project_unit = None
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", on_close)
+
+        ttk.Button(btn_frame, text="确定", command=on_confirm, width=12).pack(side="left", padx=10)
+        ttk.Button(btn_frame, text="取消", command=on_cancel, width=12).pack(side="left", padx=10)
+
+        # 回车键确认
+        entry_name.bind("<Return>", lambda e: entry_unit.focus_set())
+        entry_unit.bind("<Return>", lambda e: on_confirm())
+
         # 居中显示
         dialog.update_idletasks()
         width = dialog.winfo_width()
         height = dialog.winfo_height()
         x = (dialog.winfo_screenwidth() // 2) - (width // 2)
         y = (dialog.winfo_screenheight() // 2) - (height // 2)
-        dialog.geometry(f"{width}x{height}+{x}+{y}")
-        
-        # 存储用户输入
-        self.new_project_name = None
-        self.new_project_unit = None
-        
-        # 处理右上角关闭按钮
-        def on_close():
-            self.new_project_name = None
-            self.new_project_unit = None
-            dialog.destroy()
-        
-        dialog.protocol("WM_DELETE_WINDOW", on_close)
-        
-        # 论证项目名称
-        ttk.Label(dialog, text="请输入论证项目名称：", font=("SimHei", 11)).pack(pady=(15, 5))
-        name_var = tk.StringVar()
-        entry_name = ttk.Entry(dialog, textvariable=name_var, width=40)
-        entry_name.pack(pady=5, padx=30)
-        entry_name.focus_set()
-        
-        # 申请论证单位
-        ttk.Label(dialog, text="请输入申请论证单位：", font=("SimHei", 11)).pack(pady=(10, 5))
-        unit_var = tk.StringVar()
-        entry_unit = ttk.Entry(dialog, textvariable=unit_var, width=40)
-        entry_unit.pack(pady=5, padx=30)
-        
-        # 按钮框架
-        btn_frame = ttk.Frame(dialog)
-        btn_frame.pack(pady=20)
-        
-        def on_confirm():
-            self.new_project_name = name_var.get().strip() or "未命名论证项目"
-            self.new_project_unit = unit_var.get().strip() or "未指定单位"
-            dialog.destroy()
-        
-        def on_cancel():
-            self.new_project_name = None
-            self.new_project_unit = None
-            dialog.destroy()
-        
-        ttk.Button(btn_frame, text="确定", command=on_confirm, width=12).pack(side="left", padx=10)
-        ttk.Button(btn_frame, text="取消", command=on_cancel, width=12).pack(side="left", padx=10)
-        
-        # 回车键确认
-        entry_name.bind("<Return>", lambda e: entry_unit.focus_set())
-        entry_unit.bind("<Return>", lambda e: on_confirm())
-        
+        dialog.geometry(f"+{x}+{y}")
+
         # 等待用户操作
         dialog.transient(self)
         dialog.grab_set()
         self.wait_window(dialog)
-        
+
         # 用户取消
         if self.new_project_name is None:
             return
-        
+
+        # 查找选中的预设
+        preset_id = self.new_preset_id
+        preset = None
+        for p in presets:
+            if p["id"] == preset_id:
+                preset = p
+                break
+        if not preset:
+            return
+
+        self.draw_preset_name = preset["name"]
+        self.draw_total = preset["total"]
+        self.draw_count1 = preset["count1"]
+        self.draw_count2 = preset["count2"]
+
         # 显示抽签界面
         self._show_view("new")
         self.title_var.set(self.new_project_name)
         self.unit_var.set(self.new_project_unit)
-        self.present_var.set("0 / 3")
+        self.present_var.set(f"0 / {self.draw_total}")
         self.name_var.set("")
         self.phone_var.set("")
         self.unit_display_var.set("")
+        self.db_source_var.set("专家一库")
         self.set_buttons_state(started=False)
         self.current_session_id = None
-        
+
         # 自动开始新抽签
         self._auto_start_session()
 
@@ -1630,31 +1981,38 @@ class DrawFrame(ttk.Frame):
 
     def _build_new_draw_ui(self):
         outer = self.new_draw_frame
-        
+
         # 信息区域（居中显示）
         info_frame = ttk.Frame(outer)
         info_frame.pack(pady=30)
-        
+
         # 论证项目名称（同一行显示）
         self.title_var = tk.StringVar()
         title_row = ttk.Frame(info_frame)
         title_row.pack(pady=5)
         ttk.Label(title_row, text="论证项目名称：", font=("SimHei", 12)).pack(side="left")
         ttk.Label(title_row, textvariable=self.title_var, font=("SimHei", 12, "bold")).pack(side="left", padx=5)
-        
+
         # 申请论证单位（同一行显示）
         self.unit_var = tk.StringVar()
         unit_row = ttk.Frame(info_frame)
         unit_row.pack(pady=5)
         ttk.Label(unit_row, text="申请论证单位：", font=("SimHei", 12)).pack(side="left")
         ttk.Label(unit_row, textvariable=self.unit_var, font=("SimHei", 12, "bold")).pack(side="left", padx=5)
-        
+
         # 已到场专家（同一行显示）
         self.present_var = tk.StringVar(value="0 / 3")
         present_row = ttk.Frame(info_frame)
         present_row.pack(pady=5)
         ttk.Label(present_row, text="已到场专家：", font=("SimHei", 12)).pack(side="left")
         ttk.Label(present_row, textvariable=self.present_var, font=("SimHei", 12, "bold")).pack(side="left", padx=5)
+
+        # 当前抽取来源
+        self.db_source_var = tk.StringVar(value="专家一库")
+        source_row = ttk.Frame(info_frame)
+        source_row.pack(pady=5)
+        ttk.Label(source_row, text="当前抽取：", font=("SimHei", 12)).pack(side="left")
+        ttk.Label(source_row, textvariable=self.db_source_var, font=("SimHei", 12, "bold")).pack(side="left", padx=5)
 
         ttk.Separator(outer, orient="horizontal").pack(fill="x", pady=8)
 
@@ -1680,7 +2038,7 @@ class DrawFrame(ttk.Frame):
         ttk.Label(person_frame, textvariable=self.phone_var).grid(
             row=1, column=1, sticky="w", padx=20, pady=10
         )
-        
+
         ttk.Label(person_frame, text="单位:").grid(
             row=2, column=0, sticky="e", padx=20, pady=10
         )
@@ -1709,11 +2067,12 @@ class DrawFrame(ttk.Frame):
         self.btn_absent.grid(row=0, column=1, padx=10)
         self.btn_cancel.grid(row=0, column=2, padx=10)
 
-        ttk.Label(
+        self.explain_label = ttk.Label(
             outer,
-            text="说明：一次抽签流程中，将依次确认 3 名到场人员。不到场需填写理由并可继续抽下一位。",
+            text="说明：一次抽签流程中，将依次确认到场人员。不到场需填写理由并可继续抽下一位。",
             foreground="gray",
-        ).pack(pady=20)
+        )
+        self.explain_label.pack(pady=20)
 
         self.set_buttons_state(started=False)
 
@@ -1775,6 +2134,11 @@ class DrawFrame(ttk.Frame):
         self.supp_present_var = tk.StringVar()
         ttk.Label(supp_info, textvariable=self.supp_present_var).grid(row=1, column=1, sticky="w", padx=10, pady=5)
 
+        # 补抽来源显示
+        self.supp_source_var = tk.StringVar()
+        ttk.Label(supp_info, text="当前抽取:").grid(row=2, column=0, sticky="e", padx=10, pady=5)
+        ttk.Label(supp_info, textvariable=self.supp_source_var).grid(row=2, column=1, sticky="w", padx=10, pady=5)
+
         ttk.Separator(self.supp_step3, orient="horizontal").pack(fill="x", pady=5)
 
         supp_draw_info = ttk.Frame(self.supp_step3)
@@ -1831,12 +2195,13 @@ class DrawFrame(ttk.Frame):
         self.supp_present_logs_by_id = {}
         logs = self.app.db.get_present_logs(self.supplement_session_id)
         for r in logs:
+            source_text = "专家一库" if r.get("source_db", 1) == 1 else "专家二库"
             var = tk.BooleanVar(value=False)
             self.supp_check_vars[r["id"]] = var
             self.supp_present_logs_by_id[r["id"]] = r
             cb = ttk.Checkbutton(
                 self.supp_check_frame,
-                text=f"{r['name']}（{r['phone']}）",
+                text=f"{r['name']}（{r['phone']}）- {source_text}",
                 variable=var,
             )
             cb.pack(anchor="w", padx=5, pady=3)
@@ -1850,13 +2215,21 @@ class DrawFrame(ttk.Frame):
         self.supp_present_count = 0
         self.supp_current_person = None
         self.supp_order_no = self.supplement_order_base
-        people = self.app.db.get_available_people()
-        self.supp_people_cache = list(people)
-        self.supp_drawn_person_ids = set()
+        # 加载双库人员
+        self.supp_people1_cache = list(self.app.db.get_available_people())
+        self.supp_people2_cache = list(self.app.db.get_available_people2())
+        self.supp_drawn_person_ids1 = set()
+        self.supp_drawn_person_ids2 = set()
         c = self.app.db.conn.cursor()
-        c.execute("SELECT person_id FROM draw_logs WHERE session_id=?", (self.supp_new_session_id,))
+        c.execute("SELECT person_id, source_db FROM draw_logs WHERE session_id=?", (self.supp_new_session_id,))
         for row in c.fetchall():
-            self.supp_drawn_person_ids.add(row["person_id"])
+            sd = row["source_db"] if "source_db" in row.keys() else 1
+            if sd == 2:
+                self.supp_drawn_person_ids2.add(row["person_id"])
+            else:
+                self.supp_drawn_person_ids1.add(row["person_id"])
+        self.supp_present_count1 = 0
+        self.supp_present_count2 = 0
         self.supp_status_var.set(f"需补 {self.supplement_vacant_count} 人")
         self.supp_present_var.set(f"0 / {self.supplement_vacant_count}")
         self.supp_name_var.set("")
@@ -1869,6 +2242,18 @@ class DrawFrame(ttk.Frame):
         self.supp_btn_draw["state"] = "normal"
         self.supp_btn_present["state"] = "disabled"
         self.supp_btn_absent["state"] = "disabled"
+        # 更新来源显示
+        self._update_supp_source_display()
+
+    def _update_supp_source_display(self):
+        """更新补抽来源显示"""
+        source_db = self._get_supp_current_source_db()
+        if source_db == 1:
+            self.supp_source_var.set("专家一库")
+        elif source_db == 2:
+            self.supp_source_var.set("专家二库")
+        else:
+            self.supp_source_var.set("已完成")
 
     def _supplement_on_session_selected(self):
         sel = self.supp_sessions_tree.selection()
@@ -1879,7 +2264,7 @@ class DrawFrame(ttk.Frame):
         self._show_supplement_step2()
 
     def _supplement_confirm_absent(self):
-        """补签时标记不到场：新增记录（到场情况=后续不到场，备注=专家后续不到场，进行再次抽选。），不修改原记录"""
+        """补签时标记不到场"""
         selected = [log_id for log_id, var in self.supp_check_vars.items() if var.get()]
         if not selected:
             messagebox.showwarning("提示", "请至少勾选一名需改为不到场的到场人员")
@@ -1889,9 +2274,12 @@ class DrawFrame(ttk.Frame):
         row = c.fetchone()
         original_title = row["title"] if row else ""
         new_title = f"（补抽）{original_title}"
-        
+
         self.supp_new_session_id = self.app.db.create_session(new_title)
-        
+
+        # 统计每个库需要补抽的人数
+        self.supp_needed_per_db = {1: 0, 2: 0}
+
         selected_sorted = sorted(
             selected,
             key=lambda lid: self.supp_present_logs_by_id[lid]["order_no"] if lid in self.supp_present_logs_by_id else 0,
@@ -1900,14 +2288,23 @@ class DrawFrame(ttk.Frame):
         for log_id in selected_sorted:
             log_info = self.supp_present_logs_by_id.get(log_id)
             if log_info:
+                source = log_info.get("source_db", 1)
+                if "source_db" in log_info.keys():
+                    source = log_info["source_db"]
+                self.supp_needed_per_db[source] = self.supp_needed_per_db.get(source, 0) + 1
                 self.app.db.add_draw_log(
                     self.supp_new_session_id,
                     log_info["person_id"],
                     order_no,
                     present=False,
                     absent_reason="专家后续不到场，进行再次抽选。",
+                    source_db=source,
                 )
-                self.app.db.decrement_present_count(log_info["person_id"])
+                # 减少到场次数
+                if source == 2:
+                    self.app.db.decrement_present_count2(log_info["person_id"])
+                else:
+                    self.app.db.decrement_present_count(log_info["person_id"])
                 order_no += 1
         self._show_supplement_step3()
 
@@ -1925,18 +2322,18 @@ class DrawFrame(ttk.Frame):
         dlg.resizable(False, False)
         container = ttk.Frame(dlg, padding=25)
         container.pack(fill="both", expand=True)
-        
+
         ttk.Label(container, text="请选择不到场理由：", font=SUBTITLE_FONT).pack(anchor="w", pady=(0, 15))
-        
+
         reason_var = tk.StringVar(value=ABSENT_REASONS[0])
         for reason in ABSENT_REASONS:
             ttk.Radiobutton(
-                container, 
-                text=reason, 
-                variable=reason_var, 
+                container,
+                text=reason,
+                variable=reason_var,
                 value=reason
             ).pack(anchor="w", pady=3)
-        
+
         res = {"value": None}
 
         def on_ok():
@@ -1951,23 +2348,37 @@ class DrawFrame(ttk.Frame):
         btn_frame.pack(pady=(20, 0))
         ttk.Button(btn_frame, text="确定", command=on_ok, width=11).pack(side="left", padx=10)
         ttk.Button(btn_frame, text="取消", command=on_cancel, width=11).pack(side="left", padx=10)
-        
+
         dlg.update_idletasks()
         width = dlg.winfo_width()
         height = dlg.winfo_height()
         x = (dlg.winfo_screenwidth() // 2) - (width // 2)
         y = (dlg.winfo_screenheight() // 2) - (height // 2)
         dlg.geometry(f"+{x}+{y}")
-        
+
         dlg.wait_window()
         return res["value"]
+
+    def _get_supp_current_source_db(self):
+        """确定补抽时下一个应从哪个库抽取"""
+        if self.supp_needed_per_db.get(1, 0) > 0:
+            return 1
+        elif self.supp_needed_per_db.get(2, 0) > 0:
+            return 2
+        else:
+            return 0
 
     def _supplement_start_animation(self):
         if self.supp_present_count >= self.supplement_vacant_count:
             messagebox.showinfo("提示", "本次补录已完成")
             return
-        
-        available_people = [p for p in self.supp_people_cache if p["id"] not in self.supp_drawn_person_ids]
+
+        source_db = self._get_supp_current_source_db()
+        if source_db == 1:
+            available_people = [p for p in self.supp_people1_cache if p["id"] not in self.supp_drawn_person_ids1]
+        else:
+            available_people = [p for p in self.supp_people2_cache if p["id"] not in self.supp_drawn_person_ids2]
+
         if not available_people:
             messagebox.showwarning("提示", "专家名库已被抽完，无法继续抽签")
             return
@@ -1980,7 +2391,12 @@ class DrawFrame(ttk.Frame):
     def _supplement_animate_draw(self):
         if not self.supp_is_drawing:
             return
-        available_people = [p for p in self.supp_people_cache if p["id"] not in self.supp_drawn_person_ids]
+        source_db = self._get_supp_current_source_db()
+        if source_db == 1:
+            available_people = [p for p in self.supp_people1_cache if p["id"] not in self.supp_drawn_person_ids1]
+        else:
+            available_people = [p for p in self.supp_people2_cache if p["id"] not in self.supp_drawn_person_ids2]
+
         if not available_people:
             self.supp_is_drawing = False
             messagebox.showwarning("提示", "专家名库已被抽完，无法继续抽签")
@@ -2005,15 +2421,24 @@ class DrawFrame(ttk.Frame):
             self.after_cancel(self.supp_animation_id)
             self.supp_animation_id = None
 
-        available_people = [p for p in self.supp_people_cache if p["id"] not in self.supp_drawn_person_ids]
+        source_db = self._get_supp_current_source_db()
+        if source_db == 1:
+            available_people = [p for p in self.supp_people1_cache if p["id"] not in self.supp_drawn_person_ids1]
+        else:
+            available_people = [p for p in self.supp_people2_cache if p["id"] not in self.supp_drawn_person_ids2]
+
         if not available_people:
             messagebox.showwarning("提示", "专家名库已被抽完，无法继续抽签")
             self.supp_btn_stop.grid_remove()
             self.supp_btn_draw.grid()
             return
-        
+
         self.supp_current_person = random.choice(available_people)
-        self.supp_drawn_person_ids.add(self.supp_current_person["id"])
+        self.supp_current_source_db = source_db
+        if source_db == 1:
+            self.supp_drawn_person_ids1.add(self.supp_current_person["id"])
+        else:
+            self.supp_drawn_person_ids2.add(self.supp_current_person["id"])
         self.supp_order_no += 1
         self.supp_name_var.set(self.supp_current_person["name"])
         self.supp_phone_var.set(self.supp_current_person["phone"])
@@ -2038,17 +2463,32 @@ class DrawFrame(ttk.Frame):
             reason = self._ask_reason_dialog()
             if reason is None:
                 return
+        source_db = self.supp_current_source_db
         self.app.db.add_draw_log(
             self.supp_new_session_id,
             self.supp_current_person["id"],
             self.supp_order_no,
             present,
             reason,
+            source_db=source_db,
         )
         if present:
             self.supp_present_count += 1
             self.supp_present_var.set(f"{self.supp_present_count} / {self.supplement_vacant_count}")
-            self.app.db.increment_present_count(self.supp_current_person["id"])
+            if source_db == 1:
+                self.app.db.increment_present_count(self.supp_current_person["id"])
+                self.supp_needed_per_db[1] = self.supp_needed_per_db.get(1, 0) - 1
+            else:
+                self.app.db.increment_present_count2(self.supp_current_person["id"])
+                self.supp_needed_per_db[2] = self.supp_needed_per_db.get(2, 0) - 1
+        else:
+            # 不到场时，从同一库重新抽取，needed 不变
+            # 将该人从已抽取集合中移除，以便重新抽取
+            if source_db == 1:
+                self.supp_drawn_person_ids1.discard(self.supp_current_person["id"])
+            else:
+                self.supp_drawn_person_ids2.discard(self.supp_current_person["id"])
+
         self.supp_current_person = None
         self.supp_name_var.set("")
         self.supp_phone_var.set("")
@@ -2056,6 +2496,8 @@ class DrawFrame(ttk.Frame):
         self.supp_btn_present.grid_remove()
         self.supp_btn_absent.grid_remove()
         self.supp_btn_draw.grid()
+        self._update_supp_source_display()
+
         if self.supp_present_count >= self.supplement_vacant_count:
             self.supp_btn_draw["state"] = "disabled"
             self.supp_status_var.set("补录已完成")
@@ -2085,25 +2527,58 @@ class DrawFrame(ttk.Frame):
             self.btn_draw.grid()
             self.btn_cancel.grid()
 
+    def _get_current_source_db(self):
+        """确定下一个应从哪个库抽取"""
+        if self.needed_count1 > 0:
+            return 1
+        elif self.needed_count2 > 0:
+            return 2
+        else:
+            return 0
+
     def _auto_start_session(self):
         """自动开始新抽签会话"""
-        people = self.app.db.get_available_people()
-        if not people:
+        people1 = self.app.db.get_available_people()
+        people2 = self.app.db.get_available_people2()
+        if not people1 and not people2:
             messagebox.showwarning("提示", "当前无可用专家（可能全部被屏蔽），请先在专家名库中添加人员或取消屏蔽")
             self._show_choice()
             return
 
-        sid = self.app.db.create_session(self.title_var.get())
+        # 检查各库人数是否足够
+        if len(people1) < self.draw_count1:
+            messagebox.showwarning("提示", f"专家一库可用人数不足 {self.draw_count1} 人，请先添加人员")
+            self._show_choice()
+            return
+        if len(people2) < self.draw_count2:
+            messagebox.showwarning("提示", f"专家二库可用人数不足 {self.draw_count2} 人，请先添加人员")
+            self._show_choice()
+            return
+
+        sid = self.app.db.create_session(self.title_var.get(), draw_preset=self.draw_preset_name)
         self.current_session_id = sid
         self.present_count = 0
         self.order_no = 0
         self.current_person = None
-        self.people_cache = list(people)
-        self.drawn_person_ids = set()
-        self.present_var.set("0 / 3")
+        self.people1_cache = list(people1)
+        self.people2_cache = list(people2)
+        self.drawn_person_ids1 = set()
+        self.drawn_person_ids2 = set()
+        self.needed_count1 = self.draw_count1
+        self.needed_count2 = self.draw_count2
+        self.present_count1 = 0
+        self.present_count2 = 0
+        self.current_source_db = 1
+        self.present_var.set(f"0 / {self.draw_total}")
         self.name_var.set("")
         self.phone_var.set("")
         self.unit_display_var.set("")
+        self.explain_label.configure(
+            text=f"说明：一次抽签流程中，将依次确认 {self.draw_total} 名到场人员（专家一库 {self.draw_count1} 人，专家二库 {self.draw_count2} 人）。不到场需填写理由并可继续抽下一位。"
+        )
+        # 更新来源显示
+        source_db = self._get_current_source_db()
+        self.db_source_var.set("专家一库" if source_db == 1 else "专家二库")
         self.set_buttons_state(started=True)
 
     def _cancel_draw(self):
@@ -2121,11 +2596,20 @@ class DrawFrame(ttk.Frame):
         if self.current_session_id is None:
             messagebox.showwarning("提示", "抽签会话未正确初始化")
             return
-        if self.present_count >= 3:
-            messagebox.showinfo("提示", "本次抽签已完成 3 名到场人员")
+        if self.present_count >= self.draw_total:
+            messagebox.showinfo("提示", f"本次抽签已完成 {self.draw_total} 名到场人员")
             return
-        
-        available_people = [p for p in self.people_cache if p["id"] not in self.drawn_person_ids]
+
+        source_db = self._get_current_source_db()
+        if source_db == 0:
+            messagebox.showinfo("提示", "本次抽签已完成")
+            return
+
+        if source_db == 1:
+            available_people = [p for p in self.people1_cache if p["id"] not in self.drawn_person_ids1]
+        else:
+            available_people = [p for p in self.people2_cache if p["id"] not in self.drawn_person_ids2]
+
         if not available_people:
             messagebox.showwarning("提示", "专家名库已被抽完，无法继续抽签")
             return
@@ -2138,7 +2622,12 @@ class DrawFrame(ttk.Frame):
     def _animate_draw(self):
         if not self.is_drawing:
             return
-        available_people = [p for p in self.people_cache if p["id"] not in self.drawn_person_ids]
+        source_db = self._get_current_source_db()
+        if source_db == 1:
+            available_people = [p for p in self.people1_cache if p["id"] not in self.drawn_person_ids1]
+        else:
+            available_people = [p for p in self.people2_cache if p["id"] not in self.drawn_person_ids2]
+
         if not available_people:
             self.is_drawing = False
             messagebox.showwarning("提示", "专家名库已被抽完，无法继续抽签")
@@ -2163,15 +2652,24 @@ class DrawFrame(ttk.Frame):
             self.after_cancel(self.draw_animation_id)
             self.draw_animation_id = None
 
-        available_people = [p for p in self.people_cache if p["id"] not in self.drawn_person_ids]
+        source_db = self._get_current_source_db()
+        if source_db == 1:
+            available_people = [p for p in self.people1_cache if p["id"] not in self.drawn_person_ids1]
+        else:
+            available_people = [p for p in self.people2_cache if p["id"] not in self.drawn_person_ids2]
+
         if not available_people:
             messagebox.showwarning("提示", "专家名库已被抽完，无法继续抽签")
             self.btn_stop.grid_remove()
             self.btn_draw.grid()
             return
-        
+
         self.current_person = random.choice(available_people)
-        self.drawn_person_ids.add(self.current_person["id"])
+        self.current_source_db = source_db
+        if source_db == 1:
+            self.drawn_person_ids1.add(self.current_person["id"])
+        else:
+            self.drawn_person_ids2.add(self.current_person["id"])
         self.order_no += 1
         self.name_var.set(self.current_person["name"])
         self.phone_var.set(self.current_person["phone"])
@@ -2195,18 +2693,34 @@ class DrawFrame(ttk.Frame):
             if reason is None:
                 return
 
+        source_db = self.current_source_db
         self.app.db.add_draw_log(
             self.current_session_id,
             self.current_person["id"],
             self.order_no,
             present,
             reason,
+            source_db=source_db,
         )
 
         if present:
             self.present_count += 1
-            self.present_var.set(f"{self.present_count} / 3")
-            self.app.db.increment_present_count(self.current_person["id"])
+            self.present_var.set(f"{self.present_count} / {self.draw_total}")
+            if source_db == 1:
+                self.needed_count1 -= 1
+                self.present_count1 += 1
+                self.app.db.increment_present_count(self.current_person["id"])
+            else:
+                self.needed_count2 -= 1
+                self.present_count2 += 1
+                self.app.db.increment_present_count2(self.current_person["id"])
+        else:
+            # 不到场时，从同一库重新抽取，needed 不变
+            # 将该人从已抽取集合中移除，以便重新抽取
+            if source_db == 1:
+                self.drawn_person_ids1.discard(self.current_person["id"])
+            else:
+                self.drawn_person_ids2.discard(self.current_person["id"])
 
         self.current_person = None
         self.name_var.set("")
@@ -2216,11 +2730,20 @@ class DrawFrame(ttk.Frame):
         self.btn_absent.grid_remove()
         self.btn_draw.grid()
 
-        if self.present_count >= 3:
+        # 更新来源显示
+        next_source = self._get_current_source_db()
+        if next_source == 1:
+            self.db_source_var.set("专家一库")
+        elif next_source == 2:
+            self.db_source_var.set("专家二库")
+        else:
+            self.db_source_var.set("已完成")
+
+        if self.present_count >= self.draw_total:
             self.btn_draw["state"] = "disabled"
             # 标记会话为已完成
             self.app.db.complete_session(self.current_session_id)
-            messagebox.showinfo("完成", "本次抽签流程已完成 3 名到场人员")
+            messagebox.showinfo("完成", f"本次抽签流程已完成 {self.draw_total} 名到场人员")
             self.app.send_sessions_email(self, [self.current_session_id])
             # 抽签完成后自动返回抽签功能界面
             self._show_choice()
@@ -2240,15 +2763,15 @@ class DrawFrame(ttk.Frame):
 
         container = ttk.Frame(dlg, padding=25)
         container.pack(fill="both", expand=True)
-        
+
         ttk.Label(container, text="请选择不到场理由：", font=SUBTITLE_FONT).pack(anchor="w", pady=(0, 15))
-        
+
         reason_var = tk.StringVar(value=ABSENT_REASONS[0])
         for reason in ABSENT_REASONS:
             ttk.Radiobutton(
-                container, 
-                text=reason, 
-                variable=reason_var, 
+                container,
+                text=reason,
+                variable=reason_var,
                 value=reason
             ).pack(anchor="w", pady=3)
 
@@ -2266,7 +2789,7 @@ class DrawFrame(ttk.Frame):
         btn_frame.pack(pady=(20, 0))
         ttk.Button(btn_frame, text="确定", command=on_ok, width=11).pack(side="left", padx=10)
         ttk.Button(btn_frame, text="取消", command=on_cancel, width=11).pack(side="left", padx=10)
-        
+
         dlg.update_idletasks()
         width = dlg.winfo_width()
         height = dlg.winfo_height()
@@ -2299,16 +2822,18 @@ class StatsFrame(ttk.Frame):
         tree_frame = ttk.Frame(outer)
         tree_frame.pack(fill="both", expand=True)
 
-        columns = ("id", "name", "unit", "present_count")
+        columns = ("id", "name", "unit", "present_count", "source")
         self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=15)
         self.tree.heading("id", text="")
         self.tree.heading("name", text="专家姓名")
         self.tree.heading("unit", text="单位")
         self.tree.heading("present_count", text="到场次数")
+        self.tree.heading("source", text="来源")
         self.tree.column("id", width=0, minwidth=0, stretch=False)
         self.tree.column("name", width=150, anchor="w")
         self.tree.column("unit", width=200, anchor="w")
         self.tree.column("present_count", width=100, anchor="center")
+        self.tree.column("source", width=120, anchor="center")
         self.tree.pack(side="left", fill="both", expand=True)
 
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
@@ -2320,14 +2845,19 @@ class StatsFrame(ttk.Frame):
             self.tree.delete(i)
         c = self.app.db.conn.cursor()
         c.execute(
-            "SELECT id, name, unit, COALESCE(present_count, 0) as present_count "
-            "FROM people WHERE blocked=0 ORDER BY present_count DESC, name ASC"
+            "SELECT id, name, unit, COALESCE(present_count, 0) as present_count, 1 as source_db "
+            "FROM people WHERE blocked=0 "
+            "UNION ALL "
+            "SELECT id, name, unit, COALESCE(present_count, 0) as present_count, 2 as source_db "
+            "FROM people2 WHERE blocked=0 "
+            "ORDER BY present_count DESC, name ASC"
         )
         for row in c.fetchall():
+            source_text = "专家一库" if row["source_db"] == 1 else "专家二库"
             self.tree.insert(
                 "",
                 "end",
-                values=(row["id"], row["name"], row["unit"] or "", row["present_count"]),
+                values=(row["id"], row["name"], row["unit"] or "", row["present_count"], source_text),
             )
         self.app.auto_adjust_columns(self.tree)
 
@@ -2574,13 +3104,38 @@ class MailConfigFrame(ttk.Frame):
         self.load_config()
 
     def build_ui(self):
-        outer = ttk.Frame(self, padding=30)
-        outer.pack(fill="both", expand=True)
+        # 使用 Canvas + Scrollbar 实现滚动
+        canvas = tk.Canvas(self)
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        self.scrollable_frame = ttk.Frame(canvas)
+
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        self._canvas_window = canvas.create_window((0, 0), window=self.scrollable_frame, anchor="n")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        # 绑定Canvas宽度变化，使内部frame跟随居中
+        def _on_canvas_configure(event):
+            canvas.itemconfig(self._canvas_window, width=event.width)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # 绑定鼠标滚轮
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        outer = self.scrollable_frame
 
         ttk.Label(outer, text="设置（仅管理员）", font=SUBTITLE_FONT).pack(
             anchor="w", padx=5, pady=(0, 15)
         )
-        
+
         # 邮件设置区域
         mail_frame = ttk.LabelFrame(outer, text="邮件设置", padding=15)
         mail_frame.pack(fill="x", pady=(0, 10), padx=10)
@@ -2638,24 +3193,24 @@ class MailConfigFrame(ttk.Frame):
         ttk.Button(btn_frame, text="保存配置", command=self.save_config, width=12).pack(
             side="left", padx=10
         )
-        
+
         # 接收邮箱列表区域（放在邮件设置内）
         ttk.Separator(mail_frame, orient="horizontal").pack(fill="x", pady=10)
-        
+
         email_list_label = ttk.Label(mail_frame, text="接收邮箱列表", font=("Microsoft YaHei", 10, "bold"))
         email_list_label.pack(anchor="w", padx=5, pady=(0, 5))
-        
+
         # 按钮栏（居中）
         email_btn_frame = ttk.Frame(mail_frame)
         email_btn_frame.pack(pady=5)
         ttk.Button(email_btn_frame, text="添加邮箱", command=self._add_email, width=10).pack(side="left", padx=5)
         ttk.Button(email_btn_frame, text="编辑邮箱", command=self._edit_email, width=10).pack(side="left", padx=5)
         ttk.Button(email_btn_frame, text="删除邮箱", command=self._delete_email, width=10).pack(side="left", padx=5)
-        
+
         # 邮箱列表
         list_frame = ttk.Frame(mail_frame)
         list_frame.pack(fill="both", expand=True, pady=5)
-        
+
         columns = ("id", "email", "name")
         self.email_tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=6)
         self.email_tree.heading("id", text="")
@@ -2665,22 +3220,61 @@ class MailConfigFrame(ttk.Frame):
         self.email_tree.column("email", width=250, anchor="w")
         self.email_tree.column("name", width=150, anchor="w")
         self.email_tree.pack(side="left", fill="both", expand=True)
-        
+
         vsb = ttk.Scrollbar(list_frame, orient="vertical", command=self.email_tree.yview)
         self.email_tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
-        
+
         self._refresh_email_list()
-        
+
         # 重置设置区域
         reset_frame = ttk.LabelFrame(outer, text="重置设置", padding=15)
         reset_frame.pack(fill="x", pady=10, padx=10)
-        
-        # 清空专家名库
+
+        # 清空专家一库
         row1 = ttk.Frame(reset_frame)
         row1.pack(fill="x", pady=5)
-        ttk.Label(row1, text="清空当前专家名库：").pack(side="left", padx=10)
-        ttk.Button(row1, text="清空名库", command=self._clear_people, width=12).pack(side="right", padx=10)
+        ttk.Label(row1, text="清空专家一库：").pack(side="left", padx=10)
+        ttk.Button(row1, text="清空专家一库", command=self._clear_people1, width=14).pack(side="right", padx=10)
+
+        # 清空专家二库
+        row2 = ttk.Frame(reset_frame)
+        row2.pack(fill="x", pady=5)
+        ttk.Label(row2, text="清空专家二库：").pack(side="left", padx=10)
+        ttk.Button(row2, text="清空专家二库", command=self._clear_people2, width=14).pack(side="right", padx=10)
+
+        # 抽签预设设置区域
+        preset_frame = ttk.LabelFrame(outer, text="抽签预设", padding=15)
+        preset_frame.pack(fill="x", pady=10, padx=10)
+
+        preset_tree_frame = ttk.Frame(preset_frame)
+        preset_tree_frame.pack(fill="both", expand=True)
+
+        columns = ("id", "name", "total", "count1", "count2")
+        self.preset_tree = ttk.Treeview(preset_tree_frame, columns=columns, show="headings", height=5)
+        self.preset_tree.heading("id", text="")
+        self.preset_tree.heading("name", text="预设名称")
+        self.preset_tree.heading("total", text="总人数")
+        self.preset_tree.heading("count1", text="专家一库人数")
+        self.preset_tree.heading("count2", text="专家二库人数")
+        self.preset_tree.column("id", width=0, minwidth=0, stretch=False)
+        self.preset_tree.column("name", width=120, anchor="center")
+        self.preset_tree.column("total", width=80, anchor="center")
+        self.preset_tree.column("count1", width=120, anchor="center")
+        self.preset_tree.column("count2", width=120, anchor="center")
+        self.preset_tree.pack(side="left", fill="both", expand=True)
+
+        vsb_preset = ttk.Scrollbar(preset_tree_frame, orient="vertical", command=self.preset_tree.yview)
+        self.preset_tree.configure(yscrollcommand=vsb_preset.set)
+        vsb_preset.pack(side="right", fill="y")
+
+        preset_btn_frame = ttk.Frame(preset_frame)
+        preset_btn_frame.pack(pady=10)
+        ttk.Button(preset_btn_frame, text="添加预设", command=self._add_preset, width=10).pack(side="left", padx=5)
+        ttk.Button(preset_btn_frame, text="编辑预设", command=self._edit_preset, width=10).pack(side="left", padx=5)
+        ttk.Button(preset_btn_frame, text="删除预设", command=self._delete_preset, width=10).pack(side="left", padx=5)
+
+        self._refresh_presets()
 
     def _refresh_email_list(self):
         for i in self.email_tree.get_children():
@@ -2769,10 +3363,131 @@ class MailConfigFrame(ttk.Frame):
             self.app.db.delete_email_recipient(int(values[0]))
             self._refresh_email_list()
 
-    def _clear_people(self):
-        if messagebox.askyesno("确认", "确定要清空专家名库吗？此操作不可恢复。"):
+    def _clear_people1(self):
+        if messagebox.askyesno("确认", "确定要清空专家一库吗？此操作不可恢复。"):
             self.app.db.delete_all_people()
-            messagebox.showinfo("成功", "专家名库已清空")
+            messagebox.showinfo("成功", "专家一库已清空")
+
+    def _clear_people2(self):
+        if messagebox.askyesno("确认", "确定要清空专家二库吗？此操作不可恢复。"):
+            self.app.db.delete_all_people2()
+            messagebox.showinfo("成功", "专家二库已清空")
+
+    # ---------- 抽签预设管理 ----------
+
+    def _refresh_presets(self):
+        for i in self.preset_tree.get_children():
+            self.preset_tree.delete(i)
+        for p in self.app.db.get_draw_presets():
+            self.preset_tree.insert(
+                "", "end",
+                values=(p["id"], p["name"], p["total"], p["count1"], p["count2"]),
+            )
+        self.app.auto_adjust_columns(self.preset_tree)
+
+    def _add_preset(self):
+        self._edit_preset_dialog()
+
+    def _edit_preset(self):
+        sel = self.preset_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请先选择一个预设")
+            return
+        values = self.preset_tree.item(sel[0], "values")
+        self._edit_preset_dialog(
+            int(values[0]), values[1], int(values[2]), int(values[3]), int(values[4])
+        )
+
+    def _edit_preset_dialog(self, preset_id=None, name="", total=3, count1=2, count2=1):
+        dlg = tk.Toplevel(self)
+        dlg.title("添加预设" if preset_id is None else "编辑预设")
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        container = ttk.Frame(dlg, padding=25)
+        container.grid(row=0, column=0, sticky="nsew")
+        dlg.columnconfigure(0, weight=1)
+        dlg.rowconfigure(0, weight=1)
+
+        ttk.Label(container, text="预设名称:").grid(
+            row=0, column=0, padx=8, pady=10, sticky="e"
+        )
+        name_var = tk.StringVar(value=name)
+        ttk.Entry(container, textvariable=name_var, width=20).grid(
+            row=0, column=1, padx=8, pady=10, sticky="w"
+        )
+
+        ttk.Label(container, text="总人数:").grid(
+            row=1, column=0, padx=8, pady=10, sticky="e"
+        )
+        total_var = tk.StringVar(value=str(total))
+        ttk.Entry(container, textvariable=total_var, width=10).grid(
+            row=1, column=1, padx=8, pady=10, sticky="w"
+        )
+
+        ttk.Label(container, text="专家一库人数:").grid(
+            row=2, column=0, padx=8, pady=10, sticky="e"
+        )
+        count1_var = tk.StringVar(value=str(count1))
+        ttk.Entry(container, textvariable=count1_var, width=10).grid(
+            row=2, column=1, padx=8, pady=10, sticky="w"
+        )
+
+        ttk.Label(container, text="专家二库人数:").grid(
+            row=3, column=0, padx=8, pady=10, sticky="e"
+        )
+        count2_var = tk.StringVar(value=str(count2))
+        ttk.Entry(container, textvariable=count2_var, width=10).grid(
+            row=3, column=1, padx=8, pady=10, sticky="w"
+        )
+
+        def on_ok():
+            n = name_var.get().strip()
+            if not n:
+                messagebox.showwarning("提示", "预设名称不能为空")
+                return
+            try:
+                t = int(total_var.get())
+                c1 = int(count1_var.get())
+                c2 = int(count2_var.get())
+            except ValueError:
+                messagebox.showwarning("提示", "人数必须为数字")
+                return
+            if c1 + c2 != t:
+                messagebox.showwarning("提示", "专家一库人数 + 专家二库人数 必须等于总人数")
+                return
+            if preset_id is None:
+                self.app.db.add_draw_preset(n, t, c1, c2)
+            else:
+                self.app.db.update_draw_preset(preset_id, n, t, c1, c2)
+            self._refresh_presets()
+            dlg.destroy()
+
+        btn_frame = ttk.Frame(container)
+        btn_frame.grid(row=4, column=0, columnspan=2, pady=(18, 0))
+        ttk.Button(btn_frame, text="确定", command=on_ok, width=11).grid(
+            row=0, column=0, padx=10
+        )
+        ttk.Button(btn_frame, text="取消", command=dlg.destroy, width=11).grid(
+            row=0, column=1, padx=10
+        )
+
+        dlg.update_idletasks()
+        width = dlg.winfo_width()
+        height = dlg.winfo_height()
+        x = (dlg.winfo_screenwidth() // 2) - (width // 2)
+        y = (dlg.winfo_screenheight() // 2) - (height // 2)
+        dlg.geometry(f"+{x}+{y}")
+
+    def _delete_preset(self):
+        sel = self.preset_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请先选择一个预设")
+            return
+        values = self.preset_tree.item(sel[0], "values")
+        if messagebox.askyesno("确认", f"确定要删除预设 {values[1]} 吗？"):
+            self.app.db.delete_draw_preset(int(values[0]))
+            self._refresh_presets()
 
     def load_config(self):
         cfg = self.app.db.get_mail_config()
@@ -3007,8 +3722,9 @@ class App(tk.Tk):
                     state = "后续不到场"
                 else:
                     state = "不到场"
+                source_text = "专家一库" if r.get("source_db", 1) == 1 else "专家二库"
                 lines.append(
-                    f"[{r['created_at']}] 姓名:{r['name']} 手机:{r['phone']} 到场情况:{state} 备注:{r['absent_reason'] or ''}"
+                    f"[{r['created_at']}] 姓名:{r['name']} 手机:{r['phone']} 来源:{source_text} 到场情况:{state} 备注:{r['absent_reason'] or ''}"
                 )
             lines.append("=" * 60)
             lines.append("")
